@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ora"
+version = "0.1.0"
+description = "Multi-Agent Deep Research Engine — Scout → Analyst Swarm → Critic → Consensus → Synthesizer"
+requires-python = ">=3.9"
+dependencies = ["anthropic>=0.92.0"]
+
+[project.scripts]
+ora = "ora.engine:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ora*"]
