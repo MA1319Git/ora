@@ -7,6 +7,7 @@ UNKNOWN.egg-info/
 .env
 .env.local
 reports/
+evals/results/
 .DS_Store
 dist/
 build/

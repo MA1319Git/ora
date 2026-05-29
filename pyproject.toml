@@ -11,6 +11,7 @@ dependencies = ["anthropic>=0.92.0"]
 
 [project.scripts]
 ora = "ora.engine:main"
+ora-eval = "ora.eval:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

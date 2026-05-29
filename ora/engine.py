@@ -267,7 +267,6 @@ class ResearchAngle:
     question: str
     priority: str
     findings: str = ""
-    refined_findings: str = ""
 
 
 # ── Research phases ───────────────────────────────────────────────────────────
@@ -365,12 +364,17 @@ def critic_phase(question: str, angles: List[ResearchAngle], trace: "Trace | Non
 
 def consensus_phase(
     question: str, angles: List[ResearchAngle], critique: str, trace: "Trace | None" = None
-) -> None:
+) -> str:
+    """Generate one team-wide rebuttal to the critique and return it. The rebuttal
+    is a single response to the whole critique (not per-analyst), so it is returned
+    once and passed once to the synthesizer — see synthesis_phase. (Previously it
+    was copied into every angle's refined_findings and re-emitted per angle, which
+    duplicated the full rebuttal N times in the synthesizer's context.)"""
     _banner("CONSENSUS", "Analysts respond to critique")
 
     combined = "\n\n".join(f"### {a.angle}\n{a.findings}" for a in angles)
 
-    refined = run_agent(
+    return run_agent(
         system=REBUTTAL_SYSTEM,
         prompt=(
             f"Original question: {question}\n\n"
@@ -384,24 +388,21 @@ def consensus_phase(
         trace=trace,
     )
 
-    for angle in angles:
-        angle.refined_findings = refined
-
 
 def synthesis_phase(
-    question: str, angles: List[ResearchAngle], critique: str, trace: "Trace | None" = None
+    question: str, angles: List[ResearchAngle], critique: str, rebuttal: str,
+    trace: "Trace | None" = None
 ) -> str:
     _banner("SYNTHESIZER", "Writing final report")
 
+    findings = "\n\n---\n\n".join(
+        f"## Angle: {a.angle}\n\n{a.findings}" for a in angles
+    )
     context = (
         f"Research question: {question}\n\n"
-        + "\n\n---\n\n".join(
-            f"## Angle: {a.angle}\n\n"
-            f"**Original findings:**\n{a.findings}\n\n"
-            f"**Refined post-critique:**\n{a.refined_findings or '(no changes needed)'}"
-            for a in angles
-        )
-        + f"\n\n---\n\n## Critic's unresolved challenges:\n{critique}"
+        f"{findings}\n\n"
+        f"---\n\n## Analysts' rebuttal to the critique:\n{rebuttal}\n\n"
+        f"---\n\n## Critic's unresolved challenges:\n{critique}"
     )
 
     return run_agent(
@@ -471,8 +472,8 @@ def research(
 
     analyst_phase(question, angles, max_tokens, trace=trace)
     critique = critic_phase(question, angles, trace=trace)
-    consensus_phase(question, angles, critique, trace=trace)
-    report = synthesis_phase(question, angles, critique, trace=trace)
+    rebuttal = consensus_phase(question, angles, critique, trace=trace)
+    report = synthesis_phase(question, angles, critique, rebuttal, trace=trace)
     trace.log("run_end")
 
     # Persist to Ruflo memory
