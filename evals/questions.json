@@ -1,0 +1,29 @@
+{
+  "_comment": "Fixed eval set for Ora. Keep it stable so result sets are comparable across runs/variants. Skewed toward contested, multi-dimensional, genuinely-uncertain questions so the rubric's `calibration` dimension (the one the Critic -> rebuttal -> synthesis seam most affects) can discriminate between variants. Add questions over time; don't edit existing ones in place (it breaks comparability).",
+  "questions": [
+    {
+      "question": "What are the systemic risks of AI in financial markets?",
+      "why": "Ora's own canonical example; contested, spans technical/economic/regulatory angles."
+    },
+    {
+      "question": "How does mRNA vaccine technology work, and what are its main limitations?",
+      "why": "Technical depth plus real limitations/uncertainty — tests depth and calibration together."
+    },
+    {
+      "question": "What caused the 2008 financial crisis?",
+      "why": "Historical, multi-causal, genuinely contested attribution — punishes overconfident single-cause answers."
+    },
+    {
+      "question": "Is nuclear power a good solution for climate change?",
+      "why": "Value-laden; a good report must surface counter-arguments, not pick a side — directness vs calibration tension."
+    },
+    {
+      "question": "What are the long-term cognitive effects of regular cannabis use?",
+      "why": "Science is genuinely unsettled; the strongest discriminator for the calibration dimension."
+    },
+    {
+      "question": "How effective are GLP-1 drugs like tirzepatide for long-term weight management?",
+      "why": "Emerging evidence with real unknowns (durability, off-drug rebound); rewards calibrated reporting."
+    }
+  ]
+}
