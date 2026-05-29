@@ -28,6 +28,9 @@ import json
 import re
 import subprocess
 import textwrap
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,7 +40,10 @@ import anthropic
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
-client = anthropic.Anthropic()
+# max_retries lets the SDK auto-retry transient faults (timeouts, 429, 5xx) with
+# backoff — no need to hand-roll a retry loop. timeout is generous for the long,
+# non-streaming deep calls the parallel analyst swarm makes.
+client = anthropic.Anthropic(timeout=1200.0, max_retries=4)
 
 MODEL_FAST = "claude-sonnet-4-6"  # Scout, Critic — analytical, low-latency
 MODEL_DEEP = "claude-opus-4-7"    # Analyst, Rebuttal, Synthesizer — maximum depth
@@ -142,7 +148,50 @@ def memory_search(query: str, cwd: Path) -> List[dict]:
     return []
 
 
-# ── Streaming agent runner ────────────────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────────────
+
+class Trace:
+    """Structured per-run trace written to ./traces/<id>.jsonl. The trace is the
+    unit of observability: it records every model call (model, tokens) and phase
+    boundary, so a finished run is debuggable and its cost is visible after the
+    fact — Ora previously logged nothing structured."""
+
+    def __init__(self, cwd: Path):
+        self.id = uuid.uuid4().hex[:12]
+        self.steps: List[dict] = []
+        traces_dir = cwd / "traces"
+        traces_dir.mkdir(parents=True, exist_ok=True)
+        self.path = traces_dir / f"{self.id}.jsonl"
+
+    def log(self, event: str, **fields: Any) -> None:
+        record = {"trace_id": self.id, "ts": time.time(), "event": event, **fields}
+        self.steps.append(record)
+        with self.path.open("a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+    def totals(self) -> dict:
+        tok = {"input": 0, "output": 0, "cached": 0}
+        for s in self.steps:
+            for k in tok:
+                tok[k] += s.get("tokens", {}).get(k, 0)
+        return {
+            "trace_id": self.id,
+            "calls": sum(1 for s in self.steps if s["event"] == "model_call"),
+            "tokens": tok,
+            "errors": sum(1 for s in self.steps if s["event"] == "error"),
+        }
+
+
+def _usage_tokens(obj: Any) -> dict:
+    u = getattr(obj, "usage", None)
+    return {
+        "input": getattr(u, "input_tokens", 0),
+        "output": getattr(u, "output_tokens", 0),
+        "cached": getattr(u, "cache_read_input_tokens", 0),
+    }
+
+
+# ── Agent runners ───────────────────────────────────────────────────────────
 
 def run_agent(
     system: str,
@@ -151,7 +200,10 @@ def run_agent(
     max_tokens: int,
     label: str = "",
     thinking: bool = False,
+    trace: "Trace | None" = None,
 ) -> str:
+    """Streaming runner — used for the single-call phases (scout, critic, synth)
+    where live token output is good UX."""
     if label:
         print(f"\n{'─' * 60}")
         print(f"  {label}")
@@ -171,9 +223,40 @@ def run_agent(
         for text in stream.text_stream:
             print(text, end="", flush=True)
             collected.append(text)
+        final = stream.get_final_message()
 
     print()
+    if trace is not None:
+        trace.log("model_call", label=label or "agent", model=model,
+                  streamed=True, tokens=_usage_tokens(final))
     return "".join(collected)
+
+
+def run_agent_quiet(
+    system: str,
+    prompt: str,
+    model: str,
+    max_tokens: int,
+    label: str = "",
+    thinking: bool = False,
+    trace: "Trace | None" = None,
+) -> str:
+    """Non-streaming runner — used for the parallel analyst swarm, where
+    concurrent token streams would scramble the terminal. Returns the full text."""
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if thinking:
+        kwargs["thinking"] = {"type": "adaptive"}
+
+    resp = client.messages.create(**kwargs)
+    if trace is not None:
+        trace.log("model_call", label=label or "agent", model=model,
+                  streamed=False, tokens=_usage_tokens(resp))
+    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -189,7 +272,7 @@ class ResearchAngle:
 
 # ── Research phases ───────────────────────────────────────────────────────────
 
-def scout_phase(question: str) -> List[ResearchAngle]:
+def scout_phase(question: str, trace: "Trace | None" = None) -> List[ResearchAngle]:
     _banner("SCOUT", "Mapping the research landscape")
 
     raw = run_agent(
@@ -197,6 +280,8 @@ def scout_phase(question: str) -> List[ResearchAngle]:
         prompt=f"Question to research: {question}",
         model=MODEL_FAST,
         max_tokens=1024,
+        label="SCOUT  ·  Decomposing into angles",
+        trace=trace,
     )
 
     json_match = re.search(r"\[.*\]", raw, re.DOTALL)
@@ -217,11 +302,18 @@ def scout_phase(question: str) -> List[ResearchAngle]:
         return [ResearchAngle(angle="Full Analysis", question=question, priority="high")]
 
 
-def analyst_phase(question: str, angles: List[ResearchAngle], max_tokens: int) -> None:
-    _banner("ANALYST SWARM", f"{len(angles)} research threads")
+def analyst_phase(
+    question: str, angles: List[ResearchAngle], max_tokens: int, trace: "Trace | None" = None
+) -> None:
+    """Run the analyst swarm in parallel. The angles are independent, so they
+    fan out concurrently (was sequential) — wall-clock time drops to ~the slowest
+    analyst instead of the sum. Non-streaming calls (run_agent_quiet) avoid
+    interleaved terminal output; failures are isolated per analyst."""
+    _banner("ANALYST SWARM", f"{len(angles)} parallel research threads")
 
-    for i, angle in enumerate(angles, 1):
-        angle.findings = run_agent(
+    def analyze(item: "tuple[int, ResearchAngle]") -> None:
+        i, angle = item
+        angle.findings = run_agent_quiet(
             system=ANALYST_SYSTEM,
             prompt=(
                 f"Original question: {question}\n\n"
@@ -230,12 +322,30 @@ def analyst_phase(question: str, angles: List[ResearchAngle], max_tokens: int) -
             ),
             model=MODEL_DEEP,
             max_tokens=max_tokens,
-            label=f"ANALYST {i}/{len(angles)}  ·  {angle.angle}",
+            label=f"analyst:{angle.angle}",
             thinking=True,
+            trace=trace,
         )
 
+    items = list(enumerate(angles, 1))
+    with ThreadPoolExecutor(max_workers=len(items)) as ex:
+        futures = {ex.submit(analyze, it): it for it in items}
+        for fut in as_completed(futures):
+            i, angle = futures[fut]
+            try:
+                fut.result()
+                print(f"  ✓  ANALYST {i}/{len(angles)}  ·  {angle.angle}  ({len(angle.findings)} chars)")
+            except Exception as e:  # isolation — one analyst failing doesn't kill the swarm
+                if trace is not None:
+                    trace.log("error", layer=1, label=f"analyst:{angle.angle}", detail=str(e))
+                print(f"  ✗  ANALYST {i}/{len(angles)}  ·  {angle.angle}  FAILED: {e}")
 
-def critic_phase(question: str, angles: List[ResearchAngle]) -> str:
+    # A systematic failure (every analyst down) must not pass silently as "no findings".
+    if not any(a.findings for a in angles):
+        print("\n  [warning] all analysts failed — downstream phases have no findings to work from.")
+
+
+def critic_phase(question: str, angles: List[ResearchAngle], trace: "Trace | None" = None) -> str:
     _banner("CRITIC", "Stress-testing findings")
 
     combined = "\n\n".join(f"### {a.angle}\n{a.findings}" for a in angles)
@@ -249,10 +359,13 @@ def critic_phase(question: str, angles: List[ResearchAngle]) -> str:
         model=MODEL_FAST,
         max_tokens=3072,
         label="CRITIC  ·  Identifying gaps and contradictions",
+        trace=trace,
     )
 
 
-def consensus_phase(question: str, angles: List[ResearchAngle], critique: str) -> None:
+def consensus_phase(
+    question: str, angles: List[ResearchAngle], critique: str, trace: "Trace | None" = None
+) -> None:
     _banner("CONSENSUS", "Analysts respond to critique")
 
     combined = "\n\n".join(f"### {a.angle}\n{a.findings}" for a in angles)
@@ -268,13 +381,16 @@ def consensus_phase(question: str, angles: List[ResearchAngle], critique: str) -
         max_tokens=4096,
         label="REBUTTAL  ·  Incorporating critique",
         thinking=True,
+        trace=trace,
     )
 
     for angle in angles:
         angle.refined_findings = refined
 
 
-def synthesis_phase(question: str, angles: List[ResearchAngle], critique: str) -> str:
+def synthesis_phase(
+    question: str, angles: List[ResearchAngle], critique: str, trace: "Trace | None" = None
+) -> str:
     _banner("SYNTHESIZER", "Writing final report")
 
     context = (
@@ -295,6 +411,7 @@ def synthesis_phase(question: str, angles: List[ResearchAngle], critique: str) -
         max_tokens=6144,
         label="SYNTHESIZER  ·  Final report",
         thinking=True,
+        trace=trace,
     )
 
 
@@ -334,25 +451,29 @@ def research(
     cwd = Path(output_dir) if output_dir else Path.cwd()
     max_tokens = DEPTH_TOKENS[depth]
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    trace = Trace(cwd)
+    trace.log("run_start", question=question, depth=depth)
 
     _banner("ORA  ·  Deep Research Engine", ts)
     print(f"\n  Question : {question}")
     print(f"  Depth    : {depth}  ({max_tokens} tokens/analyst)")
+    print(f"  Trace    : traces/{trace.id}.jsonl")
 
     prior = memory_search(question, cwd=cwd)
     if prior:
         print(f"\n  [memory] {len(prior)} related session(s) found")
 
-    angles = scout_phase(question)
+    angles = scout_phase(question, trace=trace)
     print(f"\n  Angles identified:")
     for a in angles:
         marker = "●" if a.priority == "high" else "○"
         print(f"    {marker}  {a.angle}: {a.question}")
 
-    analyst_phase(question, angles, max_tokens)
-    critique = critic_phase(question, angles)
-    consensus_phase(question, angles, critique)
-    report = synthesis_phase(question, angles, critique)
+    analyst_phase(question, angles, max_tokens, trace=trace)
+    critique = critic_phase(question, angles, trace=trace)
+    consensus_phase(question, angles, critique, trace=trace)
+    report = synthesis_phase(question, angles, critique, trace=trace)
+    trace.log("run_end")
 
     # Persist to Ruflo memory
     angle_tags = [_slug(a.angle) for a in angles]
@@ -378,6 +499,12 @@ def research(
             f"---\n\n{report}"
         )
         print(f"\n  [saved] reports/{filename.name}")
+
+    totals = trace.totals()
+    tok = totals["tokens"]
+    print(f"\n  [trace] {totals['calls']} calls · "
+          f"{tok['input']} in / {tok['output']} out / {tok['cached']} cached tokens · "
+          f"{totals['errors']} error(s) · traces/{trace.id}.jsonl")
 
     return report
 
