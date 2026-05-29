@@ -286,7 +286,8 @@ def load_questions() -> List[str]:
 
 # ── Commands ───────────────────────────────────────────────────────────────────
 
-def cmd_run(label: str, depth: str, limit: Optional[int], confirm: bool) -> None:
+def cmd_run(label: str, depth: str, limit: Optional[int], confirm: bool,
+            use_memory: bool = False) -> None:
     questions = load_questions()
     if limit:
         questions = questions[:limit]
@@ -301,7 +302,20 @@ def cmd_run(label: str, depth: str, limit: Optional[int], confirm: bool) -> None
         print()
         return
 
-    from ora.engine import research
+    import ora.engine as eng
+
+    # Clean-room by default: an eval must be reproducible and its runs independent.
+    # Ora persists/recalls findings via Ruflo memory, which would leak state across
+    # eval runs (and let earlier runs contaminate later ones). We neutralize the
+    # engine's memory functions here rather than change research()'s signature —
+    # keeping that contract stable. --use-memory opts back in to evaluate the
+    # memory-augmented behavior on purpose.
+    if not use_memory:
+        eng.memory_store = lambda *a, **k: None
+        eng.memory_search = lambda *a, **k: []
+        print("  [clean-room] Ruflo memory disabled for run independence "
+              "(pass --use-memory to include it)")
+    research = eng.research
 
     rs = ResultSet(label, depth, datetime.now().isoformat(timespec="seconds"), _ora_version())
     failures = 0
@@ -500,6 +514,8 @@ def main() -> None:
     pr.add_argument("--depth", choices=["shallow", "deep"], default="shallow")
     pr.add_argument("--limit", type=int, default=None, help="run only the first N questions")
     pr.add_argument("--yes", action="store_true", help="actually call the API (otherwise dry-run)")
+    pr.add_argument("--use-memory", action="store_true",
+                    help="include Ruflo memory (default: clean-room, memory disabled for run independence)")
 
     pj = sub.add_parser("judge", help="score a stored result set on the rubric (LLM-as-judge)")
     pj.add_argument("--label", required=True)
@@ -516,7 +532,7 @@ def main() -> None:
 
     args = p.parse_args()
     if args.cmd == "run":
-        cmd_run(args.label, args.depth, args.limit, args.yes)
+        cmd_run(args.label, args.depth, args.limit, args.yes, args.use_memory)
     elif args.cmd == "judge":
         cmd_judge(args.label, args.judge_model)
     elif args.cmd == "compare":
