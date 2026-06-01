@@ -9,6 +9,9 @@ description = "Multi-Agent Deep Research Engine — Scout → Analyst Swarm → 
 requires-python = ">=3.9"
 dependencies = ["anthropic>=0.92.0"]
 
+[project.optional-dependencies]
+web = ["tavily-python>=0.3.0"]
+
 [project.scripts]
 ora = "ora.engine:main"
 ora-eval = "ora.eval:main"
