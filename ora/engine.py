@@ -2,12 +2,11 @@
 """
 ora — Multi-Agent Deep Research Engine
 
-Five agents run in sequence:
+Four agents run in sequence (collapse variant — no separate rebuttal stage):
   Scout         — decomposes the question into distinct research angles
   Analyst Swarm — each analyst dives deep on one angle
   Critic        — stress-tests findings, surfaces gaps and contradictions
-  Consensus     — analysts respond to critique and refine findings
-  Synthesizer   — merges everything into a structured markdown report
+  Synthesizer   — weighs the critique and merges everything into a report
 
 Findings are stored in Ruflo memory so future sessions build on prior research.
 Reports are saved to ./reports/ relative to the working directory.
@@ -83,18 +82,11 @@ You are a critical reviewer. Stress-test analyst findings by identifying:
 For each issue: quote the specific claim, name the problem, explain why it matters.
 Do not rewrite findings — only challenge them. Structure output as markdown."""
 
-REBUTTAL_SYSTEM = """\
-You are a research analyst responding to a critical review of your team's findings.
-For each challenge raised by the critic:
-  - If valid: acknowledge it and correct or qualify the finding
-  - If partially valid: incorporate the nuance
-  - If invalid: explain specifically why, with evidence or reasoning
-
-Be precise and brief. Return only updated or annotated findings."""
-
 SYNTHESIZER_SYSTEM = """\
 You are a senior research synthesizer. Given multi-analyst findings that have been
-stress-tested by a critic and refined via rebuttal, write a comprehensive report:
+stress-tested by a critic, write a comprehensive report — weighing the critic's
+challenges directly, correcting or qualifying findings where a challenge holds and
+pushing back where it does not:
 
 # [Descriptive Title]
 
@@ -362,37 +354,14 @@ def critic_phase(question: str, angles: List[ResearchAngle], trace: "Trace | Non
     )
 
 
-def consensus_phase(
-    question: str, angles: List[ResearchAngle], critique: str, trace: "Trace | None" = None
-) -> str:
-    """Generate one team-wide rebuttal to the critique and return it. The rebuttal
-    is a single response to the whole critique (not per-analyst), so it is returned
-    once and passed once to the synthesizer — see synthesis_phase. (Previously it
-    was copied into every angle's refined_findings and re-emitted per angle, which
-    duplicated the full rebuttal N times in the synthesizer's context.)"""
-    _banner("CONSENSUS", "Analysts respond to critique")
-
-    combined = "\n\n".join(f"### {a.angle}\n{a.findings}" for a in angles)
-
-    return run_agent(
-        system=REBUTTAL_SYSTEM,
-        prompt=(
-            f"Original question: {question}\n\n"
-            f"Analyst findings:\n{combined}\n\n"
-            f"Critic's challenges:\n{critique}"
-        ),
-        model=MODEL_DEEP,
-        max_tokens=4096,
-        label="REBUTTAL  ·  Incorporating critique",
-        thinking=True,
-        trace=trace,
-    )
-
-
 def synthesis_phase(
-    question: str, angles: List[ResearchAngle], critique: str, rebuttal: str,
+    question: str, angles: List[ResearchAngle], critique: str,
     trace: "Trace | None" = None
 ) -> str:
+    """Collapse variant: the rebuttal/consensus seam is removed. The synthesizer
+    receives the analyst findings and the critic's challenges directly and is
+    instructed to weigh and resolve the critique itself, rather than relying on a
+    separate Opus rebuttal stage to pre-digest it."""
     _banner("SYNTHESIZER", "Writing final report")
 
     findings = "\n\n---\n\n".join(
@@ -401,8 +370,7 @@ def synthesis_phase(
     context = (
         f"Research question: {question}\n\n"
         f"{findings}\n\n"
-        f"---\n\n## Analysts' rebuttal to the critique:\n{rebuttal}\n\n"
-        f"---\n\n## Critic's unresolved challenges:\n{critique}"
+        f"---\n\n## Critic's challenges (weigh and resolve these as you synthesize):\n{critique}"
     )
 
     return run_agent(
@@ -472,8 +440,7 @@ def research(
 
     analyst_phase(question, angles, max_tokens, trace=trace)
     critique = critic_phase(question, angles, trace=trace)
-    rebuttal = consensus_phase(question, angles, critique, trace=trace)
-    report = synthesis_phase(question, angles, critique, rebuttal, trace=trace)
+    report = synthesis_phase(question, angles, critique, trace=trace)
     trace.log("run_end")
 
     # Persist to Ruflo memory
