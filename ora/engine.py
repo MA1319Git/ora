@@ -2,12 +2,11 @@
 """
 ora — Multi-Agent Deep Research Engine
 
-Five agents run in sequence:
+Four agents run in sequence (collapse variant — no separate rebuttal stage):
   Scout         — decomposes the question into distinct research angles
   Analyst Swarm — each analyst dives deep on one angle
   Critic        — stress-tests findings, surfaces gaps and contradictions
-  Consensus     — analysts respond to critique and refine findings
-  Synthesizer   — merges everything into a structured markdown report
+  Synthesizer   — weighs the critique and merges everything into a report
 
 Findings are stored in Ruflo memory so future sessions build on prior research.
 Reports are saved to ./reports/ relative to the working directory.
@@ -36,7 +35,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 
+import os
+
 import anthropic
+
+# ── Optional web search (Tavily) ──────────────────────────────────────────────
+# Install: pip install tavily-python
+# Enable:  export TAVILY_API_KEY=tvly-...
+try:
+    from tavily import TavilyClient as _TavilyClient
+    _tavily: "_TavilyClient | None" = (
+        _TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+        if "TAVILY_API_KEY" in os.environ
+        else None
+    )
+except ImportError:
+    _tavily = None
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
@@ -83,18 +97,11 @@ You are a critical reviewer. Stress-test analyst findings by identifying:
 For each issue: quote the specific claim, name the problem, explain why it matters.
 Do not rewrite findings — only challenge them. Structure output as markdown."""
 
-REBUTTAL_SYSTEM = """\
-You are a research analyst responding to a critical review of your team's findings.
-For each challenge raised by the critic:
-  - If valid: acknowledge it and correct or qualify the finding
-  - If partially valid: incorporate the nuance
-  - If invalid: explain specifically why, with evidence or reasoning
-
-Be precise and brief. Return only updated or annotated findings."""
-
 SYNTHESIZER_SYSTEM = """\
 You are a senior research synthesizer. Given multi-analyst findings that have been
-stress-tested by a critic and refined via rebuttal, write a comprehensive report:
+stress-tested by a critic, write a comprehensive report — weighing the critic's
+challenges directly, correcting or qualifying findings where a challenge holds and
+pushing back where it does not:
 
 # [Descriptive Title]
 
@@ -113,6 +120,37 @@ Direct answer to the original question, plus key implications.
 ---
 Write for an intelligent non-specialist. Be direct. Where issues remain unresolved
 after the critique, say so plainly rather than papering over them."""
+
+
+# ── Web search helpers ────────────────────────────────────────────────────────
+
+def _web_search(query: str, max_results: int = 5) -> List[dict]:
+    """Return up to *max_results* results as {title, url, content} dicts.
+    Returns [] silently when Tavily is unavailable or the call fails."""
+    if _tavily is None:
+        return []
+    try:
+        resp = _tavily.search(query, max_results=max_results)
+        return [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "content": r.get("content", ""),
+            }
+            for r in resp.get("results", [])
+        ]
+    except Exception:
+        return []
+
+
+def _format_sources(results: List[dict]) -> str:
+    if not results:
+        return ""
+    lines = ["## Web Sources\n"]
+    for i, r in enumerate(results, 1):
+        snippet = r["content"][:800].rstrip()
+        lines.append(f"**[{i}] {r['title']}**  \n{r['url']}\n\n{snippet}\n")
+    return "\n".join(lines)
 
 
 # ── Memory helpers (Ruflo CLI) ────────────────────────────────────────────────
@@ -302,7 +340,8 @@ def scout_phase(question: str, trace: "Trace | None" = None) -> List[ResearchAng
 
 
 def analyst_phase(
-    question: str, angles: List[ResearchAngle], max_tokens: int, trace: "Trace | None" = None
+    question: str, angles: List[ResearchAngle], max_tokens: int,
+    web: bool = True, trace: "Trace | None" = None
 ) -> None:
     """Run the analyst swarm in parallel. The angles are independent, so they
     fan out concurrently (was sequential) — wall-clock time drops to ~the slowest
@@ -312,12 +351,29 @@ def analyst_phase(
 
     def analyze(item: "tuple[int, ResearchAngle]") -> None:
         i, angle = item
+
+        # Fetch live web context before the analyst writes their findings.
+        # Sources are injected into the user prompt so the system prompt stays
+        # stable (preserving the cache_control ephemeral hit across analysts).
+        sources_block = ""
+        if web and _tavily is not None:
+            results = _web_search(angle.question)
+            if trace is not None:
+                trace.log("web_search", angle=angle.angle, query=angle.question,
+                          results=len(results))
+            if results:
+                sources_block = (
+                    "\n\n" + _format_sources(results) +
+                    "\nCite these sources inline as [1], [2], etc. where relevant."
+                )
+
         angle.findings = run_agent_quiet(
             system=ANALYST_SYSTEM,
             prompt=(
                 f"Original question: {question}\n\n"
                 f"Your research angle: {angle.angle}\n"
                 f"Specific sub-question: {angle.question}"
+                f"{sources_block}"
             ),
             model=MODEL_DEEP,
             max_tokens=max_tokens,
@@ -362,37 +418,14 @@ def critic_phase(question: str, angles: List[ResearchAngle], trace: "Trace | Non
     )
 
 
-def consensus_phase(
-    question: str, angles: List[ResearchAngle], critique: str, trace: "Trace | None" = None
-) -> str:
-    """Generate one team-wide rebuttal to the critique and return it. The rebuttal
-    is a single response to the whole critique (not per-analyst), so it is returned
-    once and passed once to the synthesizer — see synthesis_phase. (Previously it
-    was copied into every angle's refined_findings and re-emitted per angle, which
-    duplicated the full rebuttal N times in the synthesizer's context.)"""
-    _banner("CONSENSUS", "Analysts respond to critique")
-
-    combined = "\n\n".join(f"### {a.angle}\n{a.findings}" for a in angles)
-
-    return run_agent(
-        system=REBUTTAL_SYSTEM,
-        prompt=(
-            f"Original question: {question}\n\n"
-            f"Analyst findings:\n{combined}\n\n"
-            f"Critic's challenges:\n{critique}"
-        ),
-        model=MODEL_DEEP,
-        max_tokens=4096,
-        label="REBUTTAL  ·  Incorporating critique",
-        thinking=True,
-        trace=trace,
-    )
-
-
 def synthesis_phase(
-    question: str, angles: List[ResearchAngle], critique: str, rebuttal: str,
+    question: str, angles: List[ResearchAngle], critique: str,
     trace: "Trace | None" = None
 ) -> str:
+    """Collapse variant: the rebuttal/consensus seam is removed. The synthesizer
+    receives the analyst findings and the critic's challenges directly and is
+    instructed to weigh and resolve the critique itself, rather than relying on a
+    separate Opus rebuttal stage to pre-digest it."""
     _banner("SYNTHESIZER", "Writing final report")
 
     findings = "\n\n---\n\n".join(
@@ -401,8 +434,7 @@ def synthesis_phase(
     context = (
         f"Research question: {question}\n\n"
         f"{findings}\n\n"
-        f"---\n\n## Analysts' rebuttal to the critique:\n{rebuttal}\n\n"
-        f"---\n\n## Critic's unresolved challenges:\n{critique}"
+        f"---\n\n## Critic's challenges (weigh and resolve these as you synthesize):\n{critique}"
     )
 
     return run_agent(
@@ -436,6 +468,7 @@ def research(
     depth: str = "deep",
     save: bool = True,
     output_dir: "Path | None" = None,
+    web: bool = True,
 ) -> str:
     """Run a full multi-agent research session on *question*.
 
@@ -445,6 +478,8 @@ def research(
         save:       Write the report to *output_dir*/reports/ when True.
         output_dir: Base directory for reports and Ruflo memory calls.
                     Defaults to the current working directory.
+        web:        Enable live web search via Tavily (requires TAVILY_API_KEY).
+                    Falls back silently to knowledge-only mode if unavailable.
 
     Returns:
         The final synthesized report as a markdown string.
@@ -453,11 +488,14 @@ def research(
     max_tokens = DEPTH_TOKENS[depth]
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     trace = Trace(cwd)
-    trace.log("run_start", question=question, depth=depth)
+    web_active = web and _tavily is not None
+    trace.log("run_start", question=question, depth=depth, web=web_active)
 
     _banner("ORA  ·  Deep Research Engine", ts)
     print(f"\n  Question : {question}")
     print(f"  Depth    : {depth}  ({max_tokens} tokens/analyst)")
+    web_status = "enabled" if web_active else ("disabled (--no-web)" if not web else "unavailable (set TAVILY_API_KEY)")
+    print(f"  Web      : {web_status}")
     print(f"  Trace    : traces/{trace.id}.jsonl")
 
     prior = memory_search(question, cwd=cwd)
@@ -470,10 +508,9 @@ def research(
         marker = "●" if a.priority == "high" else "○"
         print(f"    {marker}  {a.angle}: {a.question}")
 
-    analyst_phase(question, angles, max_tokens, trace=trace)
+    analyst_phase(question, angles, max_tokens, web=web, trace=trace)
     critique = critic_phase(question, angles, trace=trace)
-    rebuttal = consensus_phase(question, angles, critique, trace=trace)
-    report = synthesis_phase(question, angles, critique, rebuttal, trace=trace)
+    report = synthesis_phase(question, angles, critique, trace=trace)
     trace.log("run_end")
 
     # Persist to Ruflo memory
@@ -503,7 +540,9 @@ def research(
 
     totals = trace.totals()
     tok = totals["tokens"]
-    print(f"\n  [trace] {totals['calls']} calls · "
+    searches = sum(1 for s in trace.steps if s["event"] == "web_search")
+    search_note = f" · {searches} web search(es)" if searches else ""
+    print(f"\n  [trace] {totals['calls']} calls{search_note} · "
           f"{tok['input']} in / {tok['output']} out / {tok['cached']} cached tokens · "
           f"{totals['errors']} error(s) · traces/{trace.id}.jsonl")
 
@@ -536,9 +575,15 @@ def main() -> None:
         action="store_true",
         help="Skip saving the report to ./reports/",
     )
+    parser.add_argument(
+        "--no-web",
+        action="store_true",
+        help="Disable live web search (use model knowledge only)",
+    )
     args = parser.parse_args()
 
-    research(" ".join(args.question), depth=args.depth, save=not args.no_save)
+    research(" ".join(args.question), depth=args.depth, save=not args.no_save,
+             web=not args.no_web)
 
     _banner("COMPLETE")
     print()

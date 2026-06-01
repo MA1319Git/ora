@@ -315,6 +315,15 @@ def cmd_run(label: str, depth: str, limit: Optional[int], confirm: bool,
         eng.memory_search = lambda *a, **k: []
         print("  [clean-room] Ruflo memory disabled for run independence "
               "(pass --use-memory to include it)")
+
+    # Eval is batch, not interactive: streaming buys nothing here and is the one
+    # failure mode the SDK won't auto-retry — a mid-stream connection reset kills
+    # the whole run (observed repeatedly on long Opus phases). Route every phase
+    # through Ora's non-streaming runner, which messages.create() + max_retries=4
+    # can recover from. research() resolves run_agent as a module global at call
+    # time, so reassigning it here redirects scout/critic/rebuttal/synth too.
+    eng.run_agent = eng.run_agent_quiet
+    print("  [resilient] phases run non-streaming (survives transient connection resets)")
     research = eng.research
 
     rs = ResultSet(label, depth, datetime.now().isoformat(timespec="seconds"), _ora_version())
@@ -387,6 +396,9 @@ def cmd_compare(label_a: str, label_b: str, model: str, repeats: int, seed: int)
         rb = by_q_b.get(ra.slug)
         if rb is None:
             print(f"  (skip — '{ra.slug}' not in B)")
+            continue
+        if not ra.report or not rb.report:
+            print(f"  (skip — missing report for '{ra.slug}')")
             continue
         for _ in range(repeats):
             # Blind + order-randomized: the judge never knows which variant is which,
