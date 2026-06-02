@@ -2,19 +2,22 @@
 """
 ora — Multi-Agent Deep Research Engine
 
-Four agents run in sequence (collapse variant — no separate rebuttal stage):
+Five agents run in sequence:
   Scout         — decomposes the question into distinct research angles
-  Analyst Swarm — each analyst dives deep on one angle
-  Critic        — stress-tests findings, surfaces gaps and contradictions
+  Analyst Swarm — each analyst dives deep on one angle (with live web sources)
+  Compress      — distils each analyst report to key findings (Haiku, parallel)
+  Critic        — stress-tests compressed findings, surfaces gaps
   Synthesizer   — weighs the critique and merges everything into a report
 
-Findings are stored in Ruflo memory so future sessions build on prior research.
-Reports are saved to ./reports/ relative to the working directory.
+Model routing (3-tier):
+  shallow → Scout:Haiku  Analyst:Sonnet  Compress:Haiku  Critic:Haiku  Synth:Sonnet
+  deep    → Scout:Haiku  Analyst:Opus    Compress:Haiku  Critic:Sonnet Synth:Opus
 
 CLI:
     ora "What are the systemic risks of AI in financial markets?"
     ora --depth shallow "How does mRNA therapy work?"
     ora --no-save "What caused the 2008 financial crisis?"
+    ora --no-web "What is the philosophy of Stoicism?"
 
 Module:
     from ora import research
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import textwrap
@@ -34,8 +38,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List
-
-import os
 
 import anthropic
 
@@ -52,17 +54,32 @@ try:
 except ImportError:
     _tavily = None
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Models & routing ──────────────────────────────────────────────────────────
 
-# max_retries lets the SDK auto-retry transient faults (timeouts, 429, 5xx) with
-# backoff — no need to hand-roll a retry loop. timeout is generous for the long,
-# non-streaming deep calls the parallel analyst swarm makes.
 client = anthropic.Anthropic(timeout=1200.0, max_retries=4)
 
-MODEL_FAST = "claude-sonnet-4-6"  # Scout, Critic — analytical, low-latency
-MODEL_DEEP = "claude-opus-4-7"    # Analyst, Rebuttal, Synthesizer — maximum depth
+MODEL_HAIKU = "claude-haiku-4-5-20251001"   # tier 2 — fast, cheap
+MODEL_FAST  = "claude-sonnet-4-6"            # tier 3 — balanced
+MODEL_DEEP  = "claude-opus-4-7"              # tier 4 — maximum depth
 
 DEPTH_TOKENS = {"shallow": 2048, "deep": 6144}
+
+
+def _route_models(depth: str) -> dict:
+    """3-tier model routing — cheap models for simple tasks, Opus only where needed."""
+    if depth == "shallow":
+        return dict(scout=MODEL_HAIKU, analyst=MODEL_FAST, compress=MODEL_HAIKU,
+                    critic=MODEL_HAIKU, synthesizer=MODEL_FAST)
+    return dict(scout=MODEL_HAIKU, analyst=MODEL_DEEP, compress=MODEL_HAIKU,
+                critic=MODEL_FAST, synthesizer=MODEL_DEEP)
+
+
+def _model_label(m: str) -> str:
+    for name in ("haiku", "sonnet", "opus"):
+        if name in m:
+            return name
+    return m
+
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -79,12 +96,49 @@ Return a JSON array of objects with exactly these keys:
 Return ONLY valid JSON. No prose, no markdown fences."""
 
 ANALYST_SYSTEM = """\
-You are a deep research analyst. Given a research angle and sub-question, conduct
-thorough, rigorous analysis. Ground findings in first principles, name concrete
-examples, quantify where possible, and distinguish established fact from
-speculation. Use clear markdown headers to structure your output.
+You are a deep research analyst. Your job is to produce a thorough, rigorous
+investigation of a specific research angle within a broader question.
 
-Be comprehensive and precise. Avoid vague generalities."""
+When web sources are provided, ground your analysis in those sources first.
+When no sources are provided, ground analysis in first principles and established
+knowledge. In both cases: name concrete examples, quantify where possible, and
+clearly distinguish established fact from inference or speculation.
+
+Structure your output with clear markdown headers. Your analysis should cover:
+
+1. **Core findings** — what is actually known or demonstrably true about this angle,
+   with specific evidence, numbers, and named examples
+
+2. **Mechanisms and explanations** — the underlying reasons, causes, or dynamics
+   that explain the findings; not just what but why
+
+3. **Counterarguments and limits** — where the evidence is weak, contested, or
+   context-dependent; what a reasonable skeptic would object to
+
+4. **Implications** — what the findings on this angle mean for the broader question
+
+Precision over breadth. A single well-evidenced claim is worth more than five
+vague assertions. Cite sources inline as [1], [2] when web results are provided."""
+
+COMPRESS_SYSTEM = """\
+You are a research distiller. Compress a detailed analyst report into a tight,
+information-dense summary that preserves every specific claim, number, named
+source, and cited URL — while eliminating repetition and verbose explanation.
+
+Return structured markdown with exactly these sections:
+
+## Key Findings
+3–6 bullet points. Each must be specific and concrete: name the claim, the
+evidence or source, and the magnitude or confidence level where available.
+
+## Sources & Evidence
+1–3 sentences naming the strongest sources cited, with URLs if present.
+If no web sources were cited, state that explicitly.
+
+## Primary Uncertainty
+1 sentence identifying the main unresolved question or caveat in this angle.
+
+Maximum 400 words. Do not add new claims. Do not explain your process."""
 
 CRITIC_SYSTEM = """\
 You are a critical reviewer. Stress-test analyst findings by identifying:
@@ -125,18 +179,13 @@ after the critique, say so plainly rather than papering over them."""
 # ── Web search helpers ────────────────────────────────────────────────────────
 
 def _web_search(query: str, max_results: int = 5) -> List[dict]:
-    """Return up to *max_results* results as {title, url, content} dicts.
-    Returns [] silently when Tavily is unavailable or the call fails."""
+    """Return up to *max_results* results as {title, url, content} dicts."""
     if _tavily is None:
         return []
     try:
         resp = _tavily.search(query, max_results=max_results)
         return [
-            {
-                "title": r.get("title", ""),
-                "url": r.get("url", ""),
-                "content": r.get("content", ""),
-            }
+            {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", "")}
             for r in resp.get("results", [])
         ]
     except Exception:
@@ -148,7 +197,7 @@ def _format_sources(results: List[dict]) -> str:
         return ""
     lines = ["## Web Sources\n"]
     for i, r in enumerate(results, 1):
-        snippet = r["content"][:800].rstrip()
+        snippet = r["content"][:350].rstrip()  # tightened: 800→350 chars
         lines.append(f"**[{i}] {r['title']}**  \n{r['url']}\n\n{snippet}\n")
     return "\n".join(lines)
 
@@ -189,10 +238,7 @@ def memory_search(query: str, cwd: Path) -> List[dict]:
 # ── Observability ─────────────────────────────────────────────────────────────
 
 class Trace:
-    """Structured per-run trace written to ./traces/<id>.jsonl. The trace is the
-    unit of observability: it records every model call (model, tokens) and phase
-    boundary, so a finished run is debuggable and its cost is visible after the
-    fact — Ora previously logged nothing structured."""
+    """Structured per-run trace written to ./traces/<id>.jsonl."""
 
     def __init__(self, cwd: Path):
         self.id = uuid.uuid4().hex[:12]
@@ -229,7 +275,7 @@ def _usage_tokens(obj: Any) -> dict:
     }
 
 
-# ── Agent runners ───────────────────────────────────────────────────────────
+# ── Agent runners ─────────────────────────────────────────────────────────────
 
 def run_agent(
     system: str,
@@ -239,9 +285,9 @@ def run_agent(
     label: str = "",
     thinking: bool = False,
     trace: "Trace | None" = None,
+    messages: "List[dict] | None" = None,
 ) -> str:
-    """Streaming runner — used for the single-call phases (scout, critic, synth)
-    where live token output is good UX."""
+    """Streaming runner for single-call phases (scout, critic, synthesizer)."""
     if label:
         print(f"\n{'─' * 60}")
         print(f"  {label}")
@@ -251,7 +297,7 @@ def run_agent(
         "model": model,
         "max_tokens": max_tokens,
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages or [{"role": "user", "content": prompt}],
     }
     if thinking:
         kwargs["thinking"] = {"type": "adaptive"}
@@ -278,14 +324,14 @@ def run_agent_quiet(
     label: str = "",
     thinking: bool = False,
     trace: "Trace | None" = None,
+    messages: "List[dict] | None" = None,
 ) -> str:
-    """Non-streaming runner — used for the parallel analyst swarm, where
-    concurrent token streams would scramble the terminal. Returns the full text."""
+    """Non-streaming runner for parallel swarms (analysts, compress)."""
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages or [{"role": "user", "content": prompt}],
     }
     if thinking:
         kwargs["thinking"] = {"type": "adaptive"}
@@ -305,17 +351,20 @@ class ResearchAngle:
     question: str
     priority: str
     findings: str = ""
+    compressed: str = ""  # distilled findings — used by Critic and Synthesizer
 
 
 # ── Research phases ───────────────────────────────────────────────────────────
 
-def scout_phase(question: str, trace: "Trace | None" = None) -> List[ResearchAngle]:
-    _banner("SCOUT", "Mapping the research landscape")
+def scout_phase(
+    question: str, models: dict, trace: "Trace | None" = None
+) -> List[ResearchAngle]:
+    _banner("SCOUT", f"Mapping the research landscape  [{_model_label(models['scout'])}]")
 
     raw = run_agent(
         system=SCOUT_SYSTEM,
         prompt=f"Question to research: {question}",
-        model=MODEL_FAST,
+        model=models["scout"],
         max_tokens=1024,
         label="SCOUT  ·  Decomposing into angles",
         trace=trace,
@@ -341,20 +390,14 @@ def scout_phase(question: str, trace: "Trace | None" = None) -> List[ResearchAng
 
 def analyst_phase(
     question: str, angles: List[ResearchAngle], max_tokens: int,
-    web: bool = True, trace: "Trace | None" = None
+    models: dict, web: bool = True, trace: "Trace | None" = None
 ) -> None:
-    """Run the analyst swarm in parallel. The angles are independent, so they
-    fan out concurrently (was sequential) — wall-clock time drops to ~the slowest
-    analyst instead of the sum. Non-streaming calls (run_agent_quiet) avoid
-    interleaved terminal output; failures are isolated per analyst."""
-    _banner("ANALYST SWARM", f"{len(angles)} parallel research threads")
+    """Run the analyst swarm in parallel."""
+    _banner("ANALYST SWARM",
+            f"{len(angles)} parallel threads  [{_model_label(models['analyst'])}]")
 
     def analyze(item: "tuple[int, ResearchAngle]") -> None:
         i, angle = item
-
-        # Fetch live web context before the analyst writes their findings.
-        # Sources are injected into the user prompt so the system prompt stays
-        # stable (preserving the cache_control ephemeral hit across analysts).
         sources_block = ""
         if web and _tavily is not None:
             results = _web_search(angle.question)
@@ -375,7 +418,7 @@ def analyst_phase(
                 f"Specific sub-question: {angle.question}"
                 f"{sources_block}"
             ),
-            model=MODEL_DEEP,
+            model=models["analyst"],
             max_tokens=max_tokens,
             label=f"analyst:{angle.angle}",
             thinking=True,
@@ -390,61 +433,126 @@ def analyst_phase(
             try:
                 fut.result()
                 print(f"  ✓  ANALYST {i}/{len(angles)}  ·  {angle.angle}  ({len(angle.findings)} chars)")
-            except Exception as e:  # isolation — one analyst failing doesn't kill the swarm
+            except Exception as e:
                 if trace is not None:
-                    trace.log("error", layer=1, label=f"analyst:{angle.angle}", detail=str(e))
+                    trace.log("error", layer="analyst", label=angle.angle, detail=str(e))
                 print(f"  ✗  ANALYST {i}/{len(angles)}  ·  {angle.angle}  FAILED: {e}")
 
-    # A systematic failure (every analyst down) must not pass silently as "no findings".
     if not any(a.findings for a in angles):
-        print("\n  [warning] all analysts failed — downstream phases have no findings to work from.")
+        print("\n  [warning] all analysts failed — downstream phases have no findings.")
 
 
-def critic_phase(question: str, angles: List[ResearchAngle], trace: "Trace | None" = None) -> str:
-    _banner("CRITIC", "Stress-testing findings")
+def compress_phase(
+    angles: List[ResearchAngle], models: dict, trace: "Trace | None" = None
+) -> None:
+    """Compress each analyst's findings in parallel using Haiku.
+    Populates angle.compressed — passed to Critic and Synthesizer instead of
+    full findings, cutting their input tokens by ~70-80%. Falls back to full
+    findings if compression fails."""
+    _banner("COMPRESS",
+            f"Distilling {len(angles)} reports  [{_model_label(models['compress'])}]")
 
-    combined = "\n\n".join(f"### {a.angle}\n{a.findings}" for a in angles)
+    def compress_one(item: "tuple[int, ResearchAngle]") -> None:
+        i, angle = item
+        if not angle.findings:
+            angle.compressed = ""
+            return
+        try:
+            angle.compressed = run_agent_quiet(
+                system=COMPRESS_SYSTEM,
+                prompt=f"## {angle.angle}\n\n{angle.findings}",
+                model=models["compress"],
+                max_tokens=600,
+                label=f"compress:{angle.angle}",
+                thinking=False,
+                trace=trace,
+            )
+        except Exception as e:
+            if trace is not None:
+                trace.log("error", layer="compress", label=angle.angle, detail=str(e))
+            angle.compressed = angle.findings  # fallback to full findings
+
+    items = list(enumerate(angles, 1))
+    with ThreadPoolExecutor(max_workers=len(items)) as ex:
+        futures = {ex.submit(compress_one, it): it for it in items}
+        for fut in as_completed(futures):
+            i, angle = futures[fut]
+            try:
+                fut.result()
+                if angle.findings:
+                    pct = int(100 * len(angle.compressed) / len(angle.findings))
+                    print(f"  ✓  COMPRESS {i}/{len(angles)}  ·  {angle.angle}  "
+                          f"({len(angle.compressed)}/{len(angle.findings)} chars, {pct}%)")
+                else:
+                    print(f"  –  COMPRESS {i}/{len(angles)}  ·  {angle.angle}  skipped (no findings)")
+            except Exception as e:
+                print(f"  ✗  COMPRESS {i}/{len(angles)}  ·  {angle.angle}  FAILED: {e}")
+
+
+def critic_phase(
+    question: str, angles: List[ResearchAngle], models: dict,
+    trace: "Trace | None" = None
+) -> str:
+    _banner("CRITIC",
+            f"Stress-testing findings  [{_model_label(models['critic'])}]")
+
+    # Use compressed findings (with cache_control) — Synthesizer receives the
+    # same block and gets a prompt-cache hit, saving the full findings cost again.
+    combined = "\n\n".join(
+        f"### {a.angle}\n{a.compressed or a.findings}" for a in angles
+    )
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": combined, "cache_control": {"type": "ephemeral"}},
+            {"type": "text",
+             "text": f"\nOriginal question: {question}\n\nStress-test these findings."},
+        ],
+    }]
 
     return run_agent(
         system=CRITIC_SYSTEM,
-        prompt=(
-            f"Original question: {question}\n\n"
-            f"Analyst findings to review:\n\n{combined}"
-        ),
-        model=MODEL_FAST,
+        prompt="",
+        model=models["critic"],
         max_tokens=3072,
         label="CRITIC  ·  Identifying gaps and contradictions",
         trace=trace,
+        messages=messages,
     )
 
 
 def synthesis_phase(
-    question: str, angles: List[ResearchAngle], critique: str,
+    question: str, angles: List[ResearchAngle], critique: str, models: dict,
     trace: "Trace | None" = None
 ) -> str:
-    """Collapse variant: the rebuttal/consensus seam is removed. The synthesizer
-    receives the analyst findings and the critic's challenges directly and is
-    instructed to weigh and resolve the critique itself, rather than relying on a
-    separate Opus rebuttal stage to pre-digest it."""
-    _banner("SYNTHESIZER", "Writing final report")
+    _banner("SYNTHESIZER",
+            f"Writing final report  [{_model_label(models['synthesizer'])}]")
 
-    findings = "\n\n---\n\n".join(
-        f"## Angle: {a.angle}\n\n{a.findings}" for a in angles
+    # Same combined block as Critic — gets a prompt-cache hit on the findings.
+    combined = "\n\n".join(
+        f"### {a.angle}\n{a.compressed or a.findings}" for a in angles
     )
-    context = (
-        f"Research question: {question}\n\n"
-        f"{findings}\n\n"
-        f"---\n\n## Critic's challenges (weigh and resolve these as you synthesize):\n{critique}"
-    )
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": combined, "cache_control": {"type": "ephemeral"}},
+            {"type": "text",
+             "text": (
+                 f"\nResearch question: {question}\n\n"
+                 f"---\n\n## Critic's challenges (weigh and resolve these):\n{critique}"
+             )},
+        ],
+    }]
 
     return run_agent(
         system=SYNTHESIZER_SYSTEM,
-        prompt=context,
-        model=MODEL_DEEP,
+        prompt="",
+        model=models["synthesizer"],
         max_tokens=6144,
         label="SYNTHESIZER  ·  Final report",
         thinking=True,
         trace=trace,
+        messages=messages,
     )
 
 
@@ -474,12 +582,10 @@ def research(
 
     Args:
         question:   The research question.
-        depth:      "shallow" (faster) or "deep" (thorough, default).
+        depth:      "shallow" (faster/cheaper) or "deep" (thorough, default).
         save:       Write the report to *output_dir*/reports/ when True.
         output_dir: Base directory for reports and Ruflo memory calls.
-                    Defaults to the current working directory.
         web:        Enable live web search via Tavily (requires TAVILY_API_KEY).
-                    Falls back silently to knowledge-only mode if unavailable.
 
     Returns:
         The final synthesized report as a markdown string.
@@ -488,32 +594,39 @@ def research(
     max_tokens = DEPTH_TOKENS[depth]
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     trace = Trace(cwd)
+    models = _route_models(depth)
     web_active = web and _tavily is not None
-    trace.log("run_start", question=question, depth=depth, web=web_active)
+    trace.log("run_start", question=question, depth=depth, web=web_active, models=models)
 
     _banner("ORA  ·  Deep Research Engine", ts)
     print(f"\n  Question : {question}")
     print(f"  Depth    : {depth}  ({max_tokens} tokens/analyst)")
-    web_status = "enabled" if web_active else ("disabled (--no-web)" if not web else "unavailable (set TAVILY_API_KEY)")
+    web_status = ("enabled" if web_active
+                  else ("disabled (--no-web)" if not web
+                        else "unavailable (set TAVILY_API_KEY)"))
     print(f"  Web      : {web_status}")
+    print(f"  Models   : scout={_model_label(models['scout'])}  "
+          f"analyst={_model_label(models['analyst'])}  "
+          f"critic={_model_label(models['critic'])}  "
+          f"synth={_model_label(models['synthesizer'])}")
     print(f"  Trace    : traces/{trace.id}.jsonl")
 
     prior = memory_search(question, cwd=cwd)
     if prior:
         print(f"\n  [memory] {len(prior)} related session(s) found")
 
-    angles = scout_phase(question, trace=trace)
+    angles = scout_phase(question, models=models, trace=trace)
     print(f"\n  Angles identified:")
     for a in angles:
         marker = "●" if a.priority == "high" else "○"
         print(f"    {marker}  {a.angle}: {a.question}")
 
-    analyst_phase(question, angles, max_tokens, web=web, trace=trace)
-    critique = critic_phase(question, angles, trace=trace)
-    report = synthesis_phase(question, angles, critique, trace=trace)
+    analyst_phase(question, angles, max_tokens, models=models, web=web, trace=trace)
+    compress_phase(angles, models=models, trace=trace)
+    critique = critic_phase(question, angles, models=models, trace=trace)
+    report = synthesis_phase(question, angles, critique, models=models, trace=trace)
     trace.log("run_end")
 
-    # Persist to Ruflo memory
     angle_tags = [_slug(a.angle) for a in angles]
     memory_store(
         key=f"research/{_slug(question)}",
@@ -541,9 +654,10 @@ def research(
     totals = trace.totals()
     tok = totals["tokens"]
     searches = sum(1 for s in trace.steps if s["event"] == "web_search")
-    search_note = f" · {searches} web search(es)" if searches else ""
+    search_note = f" · {searches} search(es)" if searches else ""
+    cached_note = f" · {tok['cached']} cached" if tok["cached"] else ""
     print(f"\n  [trace] {totals['calls']} calls{search_note} · "
-          f"{tok['input']} in / {tok['output']} out / {tok['cached']} cached tokens · "
+          f"{tok['input']} in / {tok['output']} out{cached_note} tokens · "
           f"{totals['errors']} error(s) · traces/{trace.id}.jsonl")
 
     return report
@@ -561,6 +675,7 @@ def main() -> None:
               ora "What are the systemic risks of AI in financial markets?"
               ora --depth shallow "How does CRISPR base editing work?"
               ora --no-save "What caused the 2008 financial crisis?"
+              ora --no-web "What is the philosophy of Stoicism?"
         """),
     )
     parser.add_argument("question", nargs="+", help="The research question")
@@ -568,7 +683,7 @@ def main() -> None:
         "--depth",
         choices=["shallow", "deep"],
         default="deep",
-        help="Research depth — shallow is faster, deep is thorough (default: deep)",
+        help="Research depth — shallow is faster/cheaper, deep is thorough (default: deep)",
     )
     parser.add_argument(
         "--no-save",
