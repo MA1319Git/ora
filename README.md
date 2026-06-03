@@ -1,21 +1,24 @@
 # Ora — Multi-Agent Deep Research Engine
 
-Ora turns a single question into a comprehensive research report by running four specialized AI agents in sequence. Each agent has a distinct role, a tuned system prompt, and the right model for its job — the result is a report that has been challenged and defended before you read it.
+Ora turns a single question into a comprehensive research report by running five specialized AI agents in sequence. Each agent has a distinct role, a tuned system prompt, and the right model for its job — the result is a report that has been challenged and defended before you read it.
 
 ```
-Scout → Analyst Swarm → Critic → Synthesizer
+Scout → Analyst Swarm → Compress → Critic → Synthesizer
 ```
 
 ---
 
 ## How it works
 
-| Agent | Model | Job |
+| Agent | Model (shallow / deep) | Job |
 |---|---|---|
-| **Scout** | Sonnet 4.6 | Breaks the question into 3–5 orthogonal research angles |
-| **Analyst Swarm** | Opus 4.7 + thinking | Each analyst dives deep on one angle, grounded in live web sources |
-| **Critic** | Sonnet 4.6 | Stress-tests all findings — gaps, contradictions, unsupported claims |
-| **Synthesizer** | Opus 4.7 + thinking | Weighs the critique directly and merges everything into a structured report |
+| **Scout** | Haiku / Haiku | Breaks the question into 3–5 orthogonal research angles |
+| **Analyst Swarm** | Sonnet / Opus + thinking | Each analyst dives deep on one angle, grounded in live web sources |
+| **Compress** | Haiku / Haiku | Distils each analyst report to key findings before passing downstream |
+| **Critic** | Haiku / Sonnet | Stress-tests compressed findings — gaps, contradictions, unsupported claims |
+| **Synthesizer** | Sonnet / Opus + thinking | Weighs the critique directly and merges everything into a structured report |
+
+Model routing follows a 3-tier strategy: cheap models (Haiku) handle structured, low-complexity tasks; expensive models (Opus) are reserved for deep reasoning. The Compress phase reduces Critic and Synthesizer input by ~80%, keeping costs low even when analysts write at full depth.
 
 Every session is stored in [Ruflo](https://ruflo.ai) semantic memory — future research on related topics builds on prior findings automatically.
 
@@ -165,6 +168,31 @@ Direct answer to the original question + key implications.
 
 ---
 
+## Cost & performance
+
+Benchmarked on a 5-angle research question with live web search enabled:
+
+| Mode | Cost | Input tokens | Calls |
+|---|---|---|---|
+| `--depth shallow` | **~$0.28** | ~21k | 13 |
+| `--depth deep` | **~$1.62** | ~23k | 13 |
+
+For comparison, the same question ran on a naive single-model routing (analysts always on Opus, no compression) cost **~$1.44 shallow / ~$2.37 deep** — the optimised routing is **80% cheaper on shallow, 31% cheaper on deep**.
+
+The cost breakdown for a deep run:
+
+| Phase | Model | Typical cost |
+|---|---|---|
+| Scout | Haiku | ~$0.001 |
+| Analyst Swarm (×5) | Opus | ~$1.15 |
+| Compress (×5) | Haiku | ~$0.02 |
+| Critic | Sonnet | ~$0.05 |
+| Synthesizer | Opus | ~$0.36 |
+
+The `[trace]` line printed at the end of every run shows exact token counts and a cost-visible breakdown per call, stored in `./traces/<id>.jsonl`.
+
+---
+
 ## Why Ora is different
 
 Most AI research is a single model answering in one shot. Ora is adversarial by design:
@@ -175,6 +203,7 @@ Most AI research is a single model answering in one shot. Ora is adversarial by 
 - **The Synthesizer resolves, not just reports** — it weighs the critique directly, correcting findings where challenges hold and pushing back where they don't
 - **Memory compounds** — every session is stored semantically; related future queries build on prior work
 - **Thinking enabled on hard agents** — Analysts and Synthesizer use Opus 4.7 with adaptive thinking
+- **3-tier model routing** — Haiku for structured tasks (scout, compress), Sonnet/Opus only where depth matters; a Compress phase cuts Critic and Synthesizer input by ~80%
 
 ---
 
